@@ -83,7 +83,7 @@ describe("Env.getAssetConfig", () => {
   });
 
   test("returns correct config for each asset", () => {
-    const assets = ["btc", "eth", "xrp", "sol", "doge"] as const;
+    const assets = ["btc", "eth", "xrp", "sol", "doge", "hype", "bnb"] as const;
     for (const asset of assets) {
       process.env.MARKET_ASSET = asset;
       const config = Env.getAssetConfig();

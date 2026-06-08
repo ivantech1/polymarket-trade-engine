@@ -29,7 +29,7 @@ This document is the primary reference for developing strategies on the Polymark
 
 ## Overview
 
-The engine trades binary prediction markets on Polymarket. Each market asks whether a crypto asset (BTC, ETH, XRP, SOL, or DOGE) will finish above or below a reference price (the "price to beat") at the end of a 5-minute or 15-minute window. The engine manages market discovery, order book subscriptions, order placement, fill tracking, and PnL accounting. Your job as a strategy author is to implement a single async function that decides what to buy, when to sell, and how to react to fills and expirations.
+The engine trades binary prediction markets on Polymarket. Each market asks whether a crypto asset (BTC, ETH, XRP, SOL, DOGE, HYPE, or BNB) will finish above or below a reference price (the "price to beat") at the end of a 5-minute or 15-minute window. The engine manages market discovery, order book subscriptions, order placement, fill tracking, and PnL accounting. Your job as a strategy author is to implement a single async function that decides what to buy, when to sell, and how to react to fills and expirations.
 
 ---
 
@@ -91,7 +91,7 @@ When `--prod` is confirmed, `process.env.PROD` is set to `"true"` so that strate
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | `TICKER` | comma-separated list | `polymarket,coinbase` | Price sources for the asset ticker. Valid values: `polymarket`, `binance`, `coinbase`, `okx`, `bybit`. |
-| `MARKET_ASSET` | string | `"btc"` | Asset to trade. Valid values: `btc`, `eth`, `xrp`, `sol`, `doge`. |
+| `MARKET_ASSET` | string | `"btc"` | Asset to trade. Valid values: `btc`, `eth`, `xrp`, `sol`, `doge`, `hype`, `bnb`. |
 | `MARKET_WINDOW` | string | `"5m"` | Market window duration. `"5m"` for 5-minute markets, `"15m"` for 15-minute markets. Set before starting the engine -- cannot be changed while running. |
 | `PROD` | boolean string | `"false"` | Set automatically by `--prod`. Do not set manually. |
 | `PRIVATE_KEY` | string | `""` | Polygon wallet private key. Required for production mode. |
@@ -106,7 +106,7 @@ When `--prod` is confirmed, `process.env.PROD` is set to `"true"` so that strate
 type Config = {
   TICKER: ("polymarket" | "binance" | "coinbase" | "okx" | "bybit")[];
   MARKET_WINDOW: "5m" | "15m";
-  MARKET_ASSET: "btc" | "eth" | "xrp" | "sol" | "doge";
+  MARKET_ASSET: "btc" | "eth" | "xrp" | "sol" | "doge" | "hype" | "bnb";
   PROD: boolean;
   PRIVATE_KEY: string;
   POLY_FUNDER_ADDRESS: string;
@@ -615,7 +615,7 @@ BUILDER_KEY=...
 BUILDER_SECRET=...
 BUILDER_PASSPHRASE=...
 
-# Asset to trade. Options: btc, eth, xrp, sol, doge
+# Asset to trade. Options: btc, eth, xrp, sol, doge, hype, bnb
 MARKET_ASSET=btc
 
 # Asset price sources. Comma-separated list of ticker providers.
@@ -805,7 +805,7 @@ The dashboard is a self-contained React + Vite app that reads logs at dev/build 
 
 | Control | Description |
 |---------|-------------|
-| **Asset** chips | Filter all panels to a single asset: BTC / ETH / XRP / SOL / DOGE. Extracted from the slug prefix. |
+| **Asset** chips | Filter all panels to a single asset: BTC / ETH / XRP / SOL / DOGE / HYPE / BNB. Extracted from the slug prefix. |
 | **Market** chips | Filter to a single window duration: 5m / 15m. Extracted from the third slug segment. |
 | ⚙ Settings | Opens a popup with timezone and data-source options. |
 
@@ -843,7 +843,7 @@ bun run scripts/orderbook.ts --continuous
 
 | Flag | Description |
 |------|-------------|
-| `--asset <a>` | Asset to monitor. Valid values: `btc`, `eth`, `xrp`, `sol`, `doge`. Sets the `MARKET_ASSET` environment variable. Defaults to `btc`. |
+| `--asset <a>` | Asset to monitor. Valid values: `btc`, `eth`, `xrp`, `sol`, `doge`, `hype`, `bnb`. Sets the `MARKET_ASSET` environment variable. Defaults to `btc`. |
 | `--market <n>` | Market slot offset or timestamp. `0` = current, `1` = next, `-1` = previous. You can also pass a Unix timestamp from a slug (e.g. `--market 1775301600`). Defaults to current. |
 | `--window <w>` | Market window duration. `5m` (default) or `15m`. Sets the `MARKET_WINDOW` environment variable for the script. |
 | `--continuous` | Follow new slots automatically as they open. Without this flag, the monitor locks to the slot resolved at startup and stays there. |

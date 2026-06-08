@@ -1,5 +1,11 @@
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { APIQueue } from "../../tracker/api-queue.ts";
+import { getSlotTS, getSlug } from "../../utils/slot.ts";
+
+// A slot ~2 days in the past: old enough to be fully resolved, but recent
+// enough that Polymarket has not archived it yet. Computed dynamically from
+// "now" so the integration tests don't rot as hardcoded slots get archived.
+const SLOTS_2_DAYS_AGO = -((2 * 24 * 60 * 60) / 300); // 5m interval → 576 slots
 
 function waitFor(fn: () => boolean, timeout = 3000): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -62,7 +68,7 @@ describe("APIQueue", () => {
   test(
     "queueEventDetails fetches event data for a known slug",
     async () => {
-      const slug = "btc-updown-5m-1776491100";
+      const slug = getSlug(SLOTS_2_DAYS_AGO);
       await q.queueEventDetails(slug);
       const event = q.eventDetails.get(slug);
       expect(event).toBeDefined();
@@ -78,9 +84,9 @@ describe("APIQueue", () => {
   test(
     "queueMarketPrice fetches complete data for a past slot",
     async () => {
-      const slot = { startTime: 1776491100000, endTime: 1776491400000 };
       process.env.MARKET_ASSET = "btc";
       process.env.MARKET_WINDOW = "5m";
+      const slot = getSlotTS(SLOTS_2_DAYS_AGO);
       const { cancel } = q.queueMarketPrice(slot);
       await waitFor(() => q.marketResult.has(slot.startTime), 15_000);
       cancel();

@@ -1,5 +1,5 @@
 export type MarketWindow = "5m" | "15m";
-export type MarketAsset = "btc" | "eth" | "xrp" | "sol" | "doge";
+export type MarketAsset = "btc" | "eth" | "xrp" | "sol" | "doge" | "hype" | "bnb";
 
 export type Config = {
   TICKER: ("polymarket" | "binance" | "coinbase" | "okx" | "bybit")[];
@@ -69,6 +69,24 @@ const ASSET_TICKER_MAP: Record<
     apiSymbol: "DOGE",
     okxInstId: "DOGE-USD",
     bybitSymbol: "DOGEUSDT",
+  },
+  hype: {
+    slugPrefix: "hype",
+    binanceStream: "hypeusdt",
+    coinbaseProduct: "HYPE-USD",
+    polymarketSymbol: "hype/usd",
+    apiSymbol: "HYPE",
+    okxInstId: "HYPE-USD",
+    bybitSymbol: "HYPEUSDT",
+  },
+  bnb: {
+    slugPrefix: "bnb",
+    binanceStream: "bnbusdt",
+    coinbaseProduct: "BNB-USD",
+    polymarketSymbol: "bnb/usd",
+    apiSymbol: "BNB",
+    okxInstId: "BNB-USD",
+    bybitSymbol: "BNBUSDT",
   },
 };
 

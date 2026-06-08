@@ -9,7 +9,7 @@ If you are not familiar with terms like order books, bids, asks, or how predicti
 
 #### Supported Markets
 
-- **BTC, ETH, XRP, SOL, DOGE** -- 5-minute and 15-minute prediction windows
+- **BTC, ETH, XRP, SOL, DOGE, HYPE, BNB** -- 5-minute and 15-minute prediction windows
 
 #### Why another engine, what's the motivation?
 
