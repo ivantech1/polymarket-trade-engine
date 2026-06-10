@@ -127,6 +127,8 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
             exited = true;
             countdownActive = false;
             clearInterval(pricePoller);
+            // only allow re-entry if we hit target; stop-loss/time means market is against us
+            if (reason !== "target hit") inPosition = true;
 
             const pendingSellIds = ctx.pendingOrders
               .filter((o) => o.action === "sell")
