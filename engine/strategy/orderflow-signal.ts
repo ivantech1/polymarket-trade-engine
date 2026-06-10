@@ -140,7 +140,7 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
               if (bid && filledShares > 0) {
                 log(`[orderflow] exit via ${reason} — FAK sell @ ${bid}`, "cyan");
                 ctx.postOrders([{
-                  req: { tokenId, action: "sell", price: bid, shares: filledShares, orderType: "FOK" },
+                  req: { tokenId, action: "sell", price: bid, shares: filledShares, orderType: "FAK" },
                   expireAtMs: ctx.slotEndMs,
                   onFilled() { log(`[orderflow] SELL filled @ ${bid} — trade complete`, "green"); },
                   onFailed(r) { log(`[orderflow] sell failed (${r})`, "red"); },
@@ -167,7 +167,7 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
               process.stdout.write("\n");
               doExit("time limit");
             }
-          }, 5_000);
+          }, 2_000);
 
           timers.push(pricePoller as unknown as NodeJS.Timeout);
         },
