@@ -137,12 +137,13 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
               ctx.emergencySells(pendingSellIds);
             } else {
               const bid = ctx.orderBook.bestBidPrice(side);
-              if (bid && filledShares > 0) {
-                log(`[orderflow] exit via ${reason} — FAK sell @ ${bid}`, "cyan");
+              const sellPrice = (bid && bid > 0) ? bid : 0.01;
+              if (filledShares > 0) {
+                log(`[orderflow] exit via ${reason} — FAK sell @ ${sellPrice}`, "cyan");
                 ctx.postOrders([{
-                  req: { tokenId, action: "sell", price: bid, shares: filledShares, orderType: "FAK" },
+                  req: { tokenId, action: "sell", price: sellPrice, shares: filledShares, orderType: "FAK" },
                   expireAtMs: ctx.slotEndMs,
-                  onFilled() { log(`[orderflow] SELL filled @ ${bid} — trade complete`, "green"); },
+                  onFilled() { log(`[orderflow] SELL filled @ ${sellPrice} — trade complete`, "green"); },
                   onFailed(r) { log(`[orderflow] sell failed (${r})`, "red"); },
                 }]);
               }
@@ -160,7 +161,7 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
             if (bid && bid >= sellTarget) {
               process.stdout.write("\n");
               doExit("target hit");
-            } else if (bid && bid <= stopLoss) {
+            } else if (!bid || bid <= stopLoss) {
               process.stdout.write("\n");
               doExit("stop-loss");
             } else if (remaining < 60_000) {
