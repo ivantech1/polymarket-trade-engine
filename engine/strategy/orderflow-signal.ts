@@ -84,6 +84,7 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
   let countdownActive = false;
   let lastBid: number | null = null;
   let consecutiveQualifying = 0;
+  let windowTraded = false;   // block re-entry after a win in the same window
   const bidHistory: number[] = [];
 
   // Dynamic thresholds based on gap (BTC price minus strike price).
@@ -120,6 +121,11 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
 
   function tryTrade() {
     if (destroyed || inPosition) return;
+
+    if (windowTraded) {
+      log(`[orderflow] skip — already won this window, no re-entry`, "yellow");
+      return;
+    }
 
     const remaining = ctx.slotEndMs - Date.now();
     if (remaining < MIN_REMAINING_MS) {
@@ -313,6 +319,18 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
             const bid = ctx.orderBook.bestBidPrice(side);
             const holdingNow = partialSold ? holdShares : filledShares;
 
+            // Regime flip check — bail immediately if market turns bearish mid-trade
+            const liveSignal = readSignal();
+            if (liveSignal && (liveSignal.regime === "TREND_DOWN" || liveSignal.regime === "LONG_SQUEEZE")) {
+              process.stdout.write("\n");
+              log(`[orderflow] REGIME FLIP — ${liveSignal.regime}, selling now`, "red");
+              fullyExited = true;
+              countdownActive = false;
+              clearInterval(pricePoller);
+              sellShares(holdingNow, "regime flip", () => { inPosition = false; });
+              return;
+            }
+
             if (holdToResolution) {
               // Recompute current gap every tick to watch for gap shrinkage
               const currentBtc = ctx.ticker.price;
@@ -353,6 +371,7 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
               partialSold = true;
               log(`[orderflow] TARGET HIT — selling all (${partialShares.toFixed(4)}sh)`, "green");
               sellShares(partialShares, "target hit", () => {
+                windowTraded = true;
                 countdownActive = false;
                 inPosition = false;
               });
