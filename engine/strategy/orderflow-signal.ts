@@ -13,6 +13,7 @@ const MIN_BUY_PRICE = 0.30;        // skip if crowd is >70% bearish
 const SIGNAL_MAX_AGE_MS = 30_000;
 const POLL_INTERVAL_MS = 10_000;
 const MIN_REMAINING_MS = 90_000;
+const MIN_GAP_USD = -75;           // skip BUY_UP if BTC is more than $75 below strike
 const PARTIAL_SELL_RATIO = 1.0;    // sell everything at target — no resolution gamble
 const REQUIRED_CONSECUTIVE = 2;    // require 2 back-to-back qualifying signals before entry
 const MAX_BID_SWING = 0.08;        // skip if book swung this much across last 4 polls
@@ -119,6 +120,16 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
       return;
     }
 
+    // Gap check — skip BUY_UP if BTC is too far below the strike price
+    const openPrice = ctx.getMarketResult()?.openPrice ?? null;
+    const btcPrice = ctx.ticker.price;
+    const gap = openPrice !== null && btcPrice !== undefined ? btcPrice - openPrice : null;
+    if (gap !== null && gap < MIN_GAP_USD) {
+      consecutiveQualifying = 0;
+      log(`[orderflow] skip — BTC $${gap.toFixed(0)} below strike (min ${MIN_GAP_USD})`, "yellow");
+      return;
+    }
+
     const qualifies =
       signal.score > 0 &&                          // long-only
       signal.score >= SCORE_THRESHOLD &&
@@ -191,8 +202,9 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
     const sellTarget = Math.min(buyPrice + REPRICE_TARGET, 0.95);
     const shares = sharesFromConfidence(signal.confidence);
 
+    const gapStr = gap !== null ? ` | gap=${gap >= 0 ? "+" : ""}${gap.toFixed(0)}` : "";
     log(
-      `[orderflow] ENTRY — ${signal.label} | score=${signal.score.toFixed(2)} conf=${signal.confidence.toFixed(2)} | UP @ ${buyPrice} → ${sellTarget.toFixed(2)} | shares=${shares}`,
+      `[orderflow] ENTRY — ${signal.label} | score=${signal.score.toFixed(2)} conf=${signal.confidence.toFixed(2)} | UP @ ${buyPrice} → ${sellTarget.toFixed(2)} | shares=${shares}${gapStr}`,
       "cyan",
     );
 
