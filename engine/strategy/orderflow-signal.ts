@@ -119,9 +119,11 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
 
     const stopLoss = buyPrice - STOP_LOSS_DELTA;
     const shares = sharesFromConfidence(signal.confidence);
+    const openPrice = ctx.getMarketResult()?.openPrice;
+    const priceToBeat = openPrice ? `$${openPrice.toFixed(2)}` : "pending";
 
     log(
-      `[orderflow] ENTRY — ${signal.label} | score=${signal.score.toFixed(2)} conf=${signal.confidence.toFixed(2)} | ${side} @ ${buyPrice} | stop=${stopLoss.toFixed(2)} | shares=${shares}`,
+      `[orderflow] ENTRY — ${signal.label} | score=${signal.score.toFixed(2)} conf=${signal.confidence.toFixed(2)} | ${side} @ ${buyPrice} | stop=${stopLoss.toFixed(2)} | shares=${shares} | BTC target=${side === "UP" ? "above" : "below"} ${priceToBeat}`,
       "cyan",
     );
 
@@ -180,7 +182,7 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
             if (exited || destroyed) { clearInterval(pricePoller); return; }
             const remaining = ctx.slotEndMs - Date.now();
             const bid = ctx.orderBook.bestBidPrice(side);
-            const line = `[orderflow] holding — bid=${bid?.toFixed(2) ?? "??"} stop=${stopLoss.toFixed(2)} remaining=${Math.round(remaining / 1000)}s`;
+            const line = `[orderflow] holding ${side} — bid=${bid?.toFixed(2) ?? "??"} stop=${stopLoss.toFixed(2)} target=${side === "UP" ? "above" : "below"} ${priceToBeat} remaining=${Math.round(remaining / 1000)}s`;
             process.stdout.write(`\r${line.padEnd(80)}`);
             if (!bid || bid <= stopLoss) {
               process.stdout.write("\n");
