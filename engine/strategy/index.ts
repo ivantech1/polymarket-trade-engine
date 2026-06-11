@@ -9,6 +9,6 @@ export const strategies: Record<string, Strategy> = {
   "orderflow-signal": orderflowSignalStrategy,
 };
 
-export const DEFAULT_STRATEGY = "simulation";
+export const DEFAULT_STRATEGY = "orderflow-signal";
 
 export type { Strategy, StrategyContext } from "./types.ts";
