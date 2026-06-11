@@ -83,11 +83,29 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
   let consecutiveQualifying = 0;
   const bidHistory: number[] = [];
 
-  function sharesFromConfidence(confidence: number): number {
-    if (confidence >= 0.85) return 10;
-    if (confidence >= 0.75) return 7;
-    if (confidence >= 0.65) return 5;
-    return 3;
+  // Dynamic thresholds based on gap (BTC price minus strike price).
+  // Large positive gap = BTC already winning → lower confidence bar, bigger target.
+  // Negative gap = BTC needs to reverse → raise confidence bar, take profits quicker.
+  function thresholdsFromGap(gap: number | null): { confidenceThreshold: number; repriceTarget: number } {
+    if (gap === null) return { confidenceThreshold: CONFIDENCE_THRESHOLD, repriceTarget: REPRICE_TARGET };
+    if (gap >= 150)  return { confidenceThreshold: 0.50, repriceTarget: 0.25 }; // well above — near-certainty, go bigger
+    if (gap >= 50)   return { confidenceThreshold: 0.52, repriceTarget: 0.22 }; // comfortably above
+    if (gap >= 0)    return { confidenceThreshold: 0.55, repriceTarget: 0.20 }; // at/just above — defaults
+    if (gap >= -30)  return { confidenceThreshold: 0.65, repriceTarget: 0.17 }; // slightly below — need stronger signal, exit quicker
+    return           { confidenceThreshold: 0.72, repriceTarget: 0.15 };        // -30 to -75 — reversal needed, very strict
+  }
+
+  function sharesFromConfidenceAndGap(confidence: number, gap: number | null): number {
+    let base: number;
+    if (confidence >= 0.85) base = 10;
+    else if (confidence >= 0.75) base = 7;
+    else if (confidence >= 0.65) base = 5;
+    else base = 3;
+    // Large positive gap = BTC clearly winning, size up
+    if (gap !== null && gap >= 150) return Math.min(base + 2, 10);
+    // Negative gap = BTC needs reversal, size down
+    if (gap !== null && gap < 0) return Math.max(base - 1, 2);
+    return base;
   }
 
   const release = ctx.hold();
@@ -130,15 +148,17 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
       return;
     }
 
+    const { confidenceThreshold, repriceTarget } = thresholdsFromGap(gap);
+
     const qualifies =
-      signal.score > 0 &&                          // long-only
+      signal.score > 0 &&
       signal.score >= SCORE_THRESHOLD &&
-      signal.confidence >= CONFIDENCE_THRESHOLD;
+      signal.confidence >= confidenceThreshold;
 
     if (!qualifies) {
       consecutiveQualifying = 0;
       log(
-        `[orderflow] skip — score=${signal.score.toFixed(2)} conf=${signal.confidence.toFixed(2)}`,
+        `[orderflow] skip — score=${signal.score.toFixed(2)} conf=${signal.confidence.toFixed(2)} (need ${confidenceThreshold.toFixed(2)})`,
         "yellow",
       );
       return;
@@ -146,8 +166,9 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
 
     consecutiveQualifying++;
     if (consecutiveQualifying < REQUIRED_CONSECUTIVE) {
+      const gapLabel = gap !== null ? ` gap=${gap >= 0 ? "+" : ""}${gap.toFixed(0)}` : "";
       log(
-        `[orderflow] signal ${consecutiveQualifying}/${REQUIRED_CONSECUTIVE} — waiting for confirmation | score=${signal.score.toFixed(2)} conf=${signal.confidence.toFixed(2)}`,
+        `[orderflow] signal ${consecutiveQualifying}/${REQUIRED_CONSECUTIVE} — waiting for confirmation | score=${signal.score.toFixed(2)} conf=${signal.confidence.toFixed(2)} threshold=${confidenceThreshold.toFixed(2)}${gapLabel}`,
         "yellow",
       );
       return;
@@ -199,8 +220,8 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
       }
     }
 
-    const sellTarget = Math.min(buyPrice + REPRICE_TARGET, 0.95);
-    const shares = sharesFromConfidence(signal.confidence);
+    const sellTarget = Math.min(buyPrice + repriceTarget, 0.95);
+    const shares = sharesFromConfidenceAndGap(signal.confidence, gap);
 
     const gapStr = gap !== null ? ` | gap=${gap >= 0 ? "+" : ""}${gap.toFixed(0)}` : "";
     log(
