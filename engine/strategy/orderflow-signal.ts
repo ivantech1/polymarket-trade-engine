@@ -369,10 +369,12 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
             if (!partialSold && bid && bid >= sellTarget) {
               process.stdout.write("\n");
               partialSold = true;
+              fullyExited = true;
+              countdownActive = false;
+              clearInterval(pricePoller);
               log(`[orderflow] TARGET HIT — selling all (${partialShares.toFixed(4)}sh)`, "green");
               sellShares(partialShares, "target hit", () => {
                 windowTraded = true;
-                countdownActive = false;
                 inPosition = false;
               });
             } else if (remaining < 60_000) {
