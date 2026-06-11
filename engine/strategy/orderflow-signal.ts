@@ -16,6 +16,7 @@ const MIN_REMAINING_MS = 90_000;
 const MIN_GAP_USD = -75;           // skip BUY_UP if BTC is more than $75 below strike
 const HOLD_GAP_THRESHOLD = 150;    // hold to resolution instead of selling when gap >= $150
 const BAIL_OUT_GAP = 30;           // bail out of hold-to-resolution if gap drops below $30
+const LATE_HOLD_PRICE = 0.90;      // switch to hold-to-resolution if bid >= this with <60s left
 const PARTIAL_SELL_RATIO = 1.0;    // sell everything at target — no resolution gamble
 const REQUIRED_CONSECUTIVE = 2;    // require 2 back-to-back qualifying signals before entry
 const MAX_BID_SWING = 0.08;        // skip if book swung this much across last 4 polls
@@ -225,7 +226,7 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
     const sellTarget = Math.min(buyPrice + repriceTarget, 0.95);
     const shares = sharesFromConfidenceAndGap(signal.confidence, gap);
 
-    const holdToResolution = gap !== null && gap >= HOLD_GAP_THRESHOLD;
+    let holdToResolution = gap !== null && gap >= HOLD_GAP_THRESHOLD;
     const gapStr = gap !== null ? ` | gap=${gap >= 0 ? "+" : ""}${gap.toFixed(0)}` : "";
     const modeStr = holdToResolution ? " | HOLD TO RESOLUTION" : ` → ${sellTarget.toFixed(2)}`;
     log(
@@ -356,8 +357,15 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
                 inPosition = false;
               });
             } else if (remaining < 60_000) {
-              process.stdout.write("\n");
-              doTimeExit();
+              // If token is already at 0.90+ don't panic sell — switch to hold mode
+              if (!partialSold && bid && bid >= LATE_HOLD_PRICE) {
+                process.stdout.write("\n");
+                log(`[orderflow] bid=${bid.toFixed(2)} ≥ ${LATE_HOLD_PRICE} with ${Math.round(remaining / 1000)}s left — holding to resolution`, "green");
+                holdToResolution = true;
+              } else {
+                process.stdout.write("\n");
+                doTimeExit();
+              }
             }
           }, 2_000);
 
