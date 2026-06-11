@@ -14,6 +14,8 @@ const SIGNAL_MAX_AGE_MS = 30_000;
 const POLL_INTERVAL_MS = 10_000;
 const MIN_REMAINING_MS = 90_000;
 const MIN_GAP_USD = -75;           // skip BUY_UP if BTC is more than $75 below strike
+const HOLD_GAP_THRESHOLD = 150;    // hold to resolution instead of selling when gap >= $150
+const BAIL_OUT_GAP = 30;           // bail out of hold-to-resolution if gap drops below $30
 const PARTIAL_SELL_RATIO = 1.0;    // sell everything at target — no resolution gamble
 const REQUIRED_CONSECUTIVE = 2;    // require 2 back-to-back qualifying signals before entry
 const MAX_BID_SWING = 0.08;        // skip if book swung this much across last 4 polls
@@ -223,9 +225,11 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
     const sellTarget = Math.min(buyPrice + repriceTarget, 0.95);
     const shares = sharesFromConfidenceAndGap(signal.confidence, gap);
 
+    const holdToResolution = gap !== null && gap >= HOLD_GAP_THRESHOLD;
     const gapStr = gap !== null ? ` | gap=${gap >= 0 ? "+" : ""}${gap.toFixed(0)}` : "";
+    const modeStr = holdToResolution ? " | HOLD TO RESOLUTION" : ` → ${sellTarget.toFixed(2)}`;
     log(
-      `[orderflow] ENTRY — ${signal.label} | score=${signal.score.toFixed(2)} conf=${signal.confidence.toFixed(2)} | UP @ ${buyPrice} → ${sellTarget.toFixed(2)} | shares=${shares}${gapStr}`,
+      `[orderflow] ENTRY — ${signal.label} | score=${signal.score.toFixed(2)} conf=${signal.confidence.toFixed(2)} | UP @ ${buyPrice}${modeStr} | shares=${shares}${gapStr}`,
       "cyan",
     );
 
@@ -248,7 +252,10 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
         expireAtMs: ctx.slotEndMs - MIN_REMAINING_MS,
 
         onFilled(filledShares) {
-          log(`[orderflow] BUY filled — ${filledShares} shares @ ${buyPrice} | target=${sellTarget.toFixed(2)}`, "green");
+          const fillMsg = holdToResolution
+            ? `[orderflow] BUY filled — ${filledShares} shares @ ${buyPrice} | holding to resolution`
+            : `[orderflow] BUY filled — ${filledShares} shares @ ${buyPrice} | target=${sellTarget.toFixed(2)}`;
+          log(fillMsg, "green");
 
           const partialShares = Math.round(filledShares * PARTIAL_SELL_RATIO * 10000) / 10000;
           const holdShares = Math.round((filledShares - partialShares) * 10000) / 10000;
@@ -304,6 +311,39 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
             const remaining = ctx.slotEndMs - Date.now();
             const bid = ctx.orderBook.bestBidPrice(side);
             const holdingNow = partialSold ? holdShares : filledShares;
+
+            if (holdToResolution) {
+              // Recompute current gap every tick to watch for gap shrinkage
+              const currentBtc = ctx.ticker.price;
+              const currentGap = openPrice !== null && currentBtc !== undefined
+                ? currentBtc - openPrice : null;
+              const gapNow = currentGap !== null ? `gap=${currentGap >= 0 ? "+" : ""}${currentGap.toFixed(0)}` : "gap=??";
+              process.stdout.write(`\r[orderflow] HOLDING TO RESOLUTION | bid=${bid?.toFixed(2) ?? "??"} ${gapNow} remaining=${Math.round(remaining / 1000)}s holding=${holdingNow.toFixed(2)}sh`.padEnd(100));
+
+              // Bail out if gap shrinks below safety threshold — BTC heading back to strike
+              if (currentGap !== null && currentGap < BAIL_OUT_GAP) {
+                process.stdout.write("\n");
+                log(`[orderflow] BAIL OUT — gap shrunk to $${currentGap.toFixed(0)}, selling now`, "red");
+                fullyExited = true;
+                countdownActive = false;
+                clearInterval(pricePoller);
+                sellShares(filledShares, "bail out gap shrink", () => { inPosition = false; });
+                return;
+              }
+
+              // Window closing — release lock and let resolution handle payout
+              if (remaining < 10_000) {
+                process.stdout.write("\n");
+                log(`[orderflow] window closing — holding ${holdingNow.toFixed(2)}sh to resolution`, "green");
+                fullyExited = true;
+                countdownActive = false;
+                clearInterval(pricePoller);
+                inPosition = false;
+              }
+              return;
+            }
+
+            // Normal mode: sell at target or time exit
             const line = `[orderflow] bid=${bid?.toFixed(2) ?? "??"} target=${sellTarget.toFixed(2)} remaining=${Math.round(remaining / 1000)}s holding=${holdingNow.toFixed(2)}sh`;
             process.stdout.write(`\r${line.padEnd(90)}`);
 
