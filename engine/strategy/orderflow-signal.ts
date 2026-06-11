@@ -8,7 +8,7 @@ const CONFIDENCE_THRESHOLD = 0.55; // raised from 0.4 — filters weak signals
 const REPRICE_TARGET = 0.20;
 const MAX_BUY_PRICE = 0.70;        // don't chase high-priced tokens
 const STOP_LOSS_DELTA = 0.15;      // exit if bid drops this far below buy price
-const SIGNAL_MAX_AGE_MS = 30_000;
+const SIGNAL_MAX_AGE_MS = 60_000;
 const POLL_INTERVAL_MS = 10_000;
 const MIN_REMAINING_MS = 90_000;
 
