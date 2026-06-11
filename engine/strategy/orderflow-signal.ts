@@ -4,13 +4,14 @@ import { join } from "path";
 
 const SIGNAL_PATH = join(import.meta.dir, "../../../signal.json");
 const SCORE_THRESHOLD = 0.4;
-const CONFIDENCE_THRESHOLD = 0.55; // raised from 0.4 — filters weak signals
-const REPRICE_TARGET = 0.20;
+const CONFIDENCE_THRESHOLD = 0.55;
 const MAX_BUY_PRICE = 0.70;        // don't chase high-priced tokens
 const STOP_LOSS_DELTA = 0.15;      // exit if bid drops this far below buy price
 const SIGNAL_MAX_AGE_MS = 60_000;
 const POLL_INTERVAL_MS = 10_000;
 const MIN_REMAINING_MS = 90_000;
+const MAX_BID_SWING = 0.08;        // skip if book swung this much across last 4 polls
+const BID_HISTORY_SIZE = 4;
 
 type Signal = {
   action: "BUY_UP" | "BUY_DOWN" | "NO_TRADE";
@@ -36,7 +37,15 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
   let inPosition = false;
   let destroyed = false;
   let countdownActive = false;
-  let lastBid: number | null = null; // for momentum check
+  let lastBid: number | null = null;
+  const bidHistory: number[] = [];
+
+  function sharesFromConfidence(confidence: number): number {
+    if (confidence >= 0.85) return 10;
+    if (confidence >= 0.75) return 7;
+    if (confidence >= 0.65) return 5;
+    return 3;
+  }
 
   const release = ctx.hold();
 
@@ -95,11 +104,24 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
     }
     lastBid = currentBid ?? lastBid;
 
-    const sellTarget = Math.min(buyPrice + REPRICE_TARGET, 0.95);
+    // Book volatility check: skip if bid has been swinging wildly across recent polls
+    if (currentBid !== null) {
+      bidHistory.push(currentBid);
+      if (bidHistory.length > BID_HISTORY_SIZE) bidHistory.shift();
+    }
+    if (bidHistory.length >= BID_HISTORY_SIZE) {
+      const swing = Math.max(...bidHistory) - Math.min(...bidHistory);
+      if (swing > MAX_BID_SWING) {
+        log(`[orderflow] skip — book unstable, swing=${swing.toFixed(3)} > max=${MAX_BID_SWING}`, "yellow");
+        return;
+      }
+    }
+
     const stopLoss = buyPrice - STOP_LOSS_DELTA;
+    const shares = sharesFromConfidence(signal.confidence);
 
     log(
-      `[orderflow] ENTRY — ${signal.label} | score=${signal.score.toFixed(2)} conf=${signal.confidence.toFixed(2)} | ${side} @ ${buyPrice} → ${sellTarget.toFixed(2)} (stop ${stopLoss.toFixed(2)})`,
+      `[orderflow] ENTRY — ${signal.label} | score=${signal.score.toFixed(2)} conf=${signal.confidence.toFixed(2)} | ${side} @ ${buyPrice} | stop=${stopLoss.toFixed(2)} | shares=${shares}`,
       "cyan",
     );
 
@@ -111,13 +133,13 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
           tokenId,
           action: "buy",
           price: buyPrice,
-          shares: 5,
+          shares,
           orderType: "FOK",
         },
         expireAtMs: ctx.slotEndMs - MIN_REMAINING_MS,
 
         onFilled(filledShares) {
-          log(`[orderflow] BUY filled — ${filledShares} shares @ ${buyPrice} | target=${sellTarget.toFixed(2)} stop=${stopLoss.toFixed(2)}`, "green");
+          log(`[orderflow] BUY filled — ${filledShares} shares @ ${buyPrice} | stop=${stopLoss.toFixed(2)} | holding to resolution`, "green");
 
           let exited = false;
           countdownActive = true;
@@ -127,8 +149,8 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
             exited = true;
             countdownActive = false;
             clearInterval(pricePoller);
-            // only allow re-entry if we hit target; stop-loss/time means market is against us
-            if (reason !== "target hit") inPosition = true;
+            // after stop-loss or time limit, block re-entry — market is against us
+            inPosition = true;
 
             const pendingSellIds = ctx.pendingOrders
               .filter((o) => o.action === "sell")
@@ -153,22 +175,22 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
             inPosition = false;
           }
 
-          // Poll bid every 5s
+          // Poll bid every 2s — only exit on stop-loss or time safety valve
           const pricePoller = setInterval(() => {
             if (exited || destroyed) { clearInterval(pricePoller); return; }
             const remaining = ctx.slotEndMs - Date.now();
             const bid = ctx.orderBook.bestBidPrice(side);
-            const line = `[orderflow] bid=${bid?.toFixed(2) ?? "??"} target=${sellTarget.toFixed(2)} stop=${stopLoss.toFixed(2)} remaining=${Math.round(remaining / 1000)}s`;
+            const line = `[orderflow] holding — bid=${bid?.toFixed(2) ?? "??"} stop=${stopLoss.toFixed(2)} remaining=${Math.round(remaining / 1000)}s`;
             process.stdout.write(`\r${line.padEnd(80)}`);
-            if (bid && bid >= sellTarget) {
-              process.stdout.write("\n");
-              doExit("target hit");
-            } else if (!bid || bid <= stopLoss) {
+            if (!bid || bid <= stopLoss) {
               process.stdout.write("\n");
               doExit("stop-loss");
-            } else if (remaining < 60_000) {
+            } else if (remaining < 20_000) {
+              // Safety valve: if still in position at 20s, let resolution handle it
               process.stdout.write("\n");
-              doExit("time limit");
+              log(`[orderflow] <20s remaining — releasing to resolution`, "dim");
+              clearInterval(pricePoller);
+              countdownActive = false;
             }
           }, 2_000);
 
