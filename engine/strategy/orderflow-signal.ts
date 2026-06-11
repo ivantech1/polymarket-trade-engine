@@ -5,8 +5,8 @@ import { join } from "path";
 const SIGNAL_PATH = join(import.meta.dir, "../../../signal.json");
 const TRADE_LOG_PATH = join(import.meta.dir, "../../logs/trades.csv");
 const TRADE_LOG_HEADER = "timestamp,window,direction,entry_price,exit_price,shares,pnl,exit_reason,score,confidence,duration_s\n";
-const SCORE_THRESHOLD = 0.4;
-const CONFIDENCE_THRESHOLD = 0.55;
+const SCORE_THRESHOLD = 0.50;
+const CONFIDENCE_THRESHOLD = 0.62;
 const REPRICE_TARGET = 0.20;
 const MAX_BUY_PRICE = 0.65;
 const MIN_BUY_PRICE = 0.30;        // skip if crowd is >70% bearish
@@ -140,10 +140,10 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
       return;
     }
 
-    // Block bearish regimes — don't fight a confirmed downtrend or squeeze
-    if (signal.regime === "TREND_DOWN" || signal.regime === "LONG_SQUEEZE") {
+    // Block bearish and directionless regimes
+    if (["TREND_DOWN", "LONG_SQUEEZE", "RANGE", "HIGH_VOLATILITY"].includes(signal.regime)) {
       consecutiveQualifying = 0;
-      log(`[orderflow] skip — bearish regime (${signal.regime})`, "yellow");
+      log(`[orderflow] skip — regime (${signal.regime})`, "yellow");
       return;
     }
 
