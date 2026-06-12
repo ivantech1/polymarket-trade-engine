@@ -1,4 +1,4 @@
-import { readFileSync, existsSync } from "fs";
+import { readFileSync, existsSync, writeFileSync } from "fs";
 import { join } from "path";
 
 const TRADES_PATH = join(import.meta.dir, "logs/trades.csv");
@@ -73,10 +73,18 @@ tr:hover td{background:#1f1f1f}
 .pill-loss{background:#450a0a;color:#f87171}
 .pill-flat{background:#1c1917;color:#a8a29e}
 .refresh{font-size:12px;color:#444;margin-bottom:16px}
+.header{display:flex;align-items:center;justify-content:space-between;margin-bottom:24px}
+.btn{font-size:12px;font-weight:500;padding:6px 14px;border-radius:8px;border:0.5px solid #333;background:#1a1a1a;color:#e0e0e0;cursor:pointer}
+.btn:hover{background:#222;border-color:#555}
+.btn-danger{border-color:#7f1d1d;color:#f87171}
+.btn-danger:hover{background:#450a0a}
 </style>
 </head>
 <body>
-<h1>Polymarket Bot</h1>
+<div class="header">
+  <h1>Polymarket Bot</h1>
+  <button class="btn btn-danger" onclick="clearTrades()">Clear Trades</button>
+</div>
 <p class="refresh" id="ts">Loading...</p>
 <div class="stats" id="stats"></div>
 <div class="chart-wrap">
@@ -171,6 +179,12 @@ async function refresh() {
   document.getElementById('rows').innerHTML = rows || '<tr><td colspan="8" style="text-align:center;color:#444;padding:32px">No trades yet</td></tr>';
 }
 
+async function clearTrades() {
+  if (!confirm('Clear all trades?')) return;
+  await fetch('/api/clear', { method: 'POST' });
+  refresh();
+}
+
 refresh();
 setInterval(refresh, 10000);
 </script>
@@ -183,6 +197,11 @@ const server = Bun.serve({
     const url = new URL(req.url);
     if (url.pathname === "/api/trades") {
       return Response.json(parseTrades());
+    }
+    if (url.pathname === "/api/clear" && req.method === "POST") {
+      const header = "timestamp,window,direction,entry_price,exit_price,shares,pnl,exit_reason,score,confidence,duration_s\n";
+      writeFileSync(TRADES_PATH, header);
+      return new Response("ok");
     }
     return new Response(PAGE, { headers: { "Content-Type": "text/html" } });
   },

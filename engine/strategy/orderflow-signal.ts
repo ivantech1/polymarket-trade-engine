@@ -5,7 +5,7 @@ import { join } from "path";
 const SIGNAL_PATH = join(import.meta.dir, "../../../signal.json");
 const TRADE_LOG_PATH = join(import.meta.dir, "../../logs/trades.csv");
 const TRADE_LOG_HEADER = "timestamp,window,direction,entry_price,exit_price,shares,pnl,exit_reason,score,confidence,duration_s\n";
-const SCORE_THRESHOLD = 0.50;
+const SCORE_THRESHOLD = 0.55;   // 0.45 flooded us with marginal coin-flips that got whipsawed
 const CONFIDENCE_THRESHOLD = 0.62;
 const REPRICE_TARGET = 0.20;
 const MAX_BUY_PRICE = 0.65;
@@ -24,6 +24,7 @@ const BID_HISTORY_SIZE = 4;
 
 // Sniper constants — last-minute "already decided" entries
 const SNIPER_THRESHOLD = 0.95;     // enter when a side's bid is at or above this
+const SNIPER_MAX_ASK = 0.93;       // never pay more than this — risk/reward is unplayable above it
 const SNIPER_BAIL = 0.90;          // sell immediately if price drops below this after entry
 const SNIPER_WINDOW_MS = 90_000;   // only snipe in the last 90 seconds
 const SNIPER_SHARES = 10;          // size up — risk is tiny at 0.95+
@@ -93,6 +94,71 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
   let consecutiveQualifying = 0;
   let windowTraded = false;   // block re-entry after a win in the same window
   const bidHistory: number[] = [];
+
+  // Trades held to resolution can't be logged at window close — the outcome
+  // isn't known yet. They're buffered here and flushed once closePrice arrives
+  // (via poller, or via cleanup since resolution can land ~ms before destroy).
+  type PendingResolution = {
+    side: "UP" | "DOWN";
+    entryPrice: number;
+    shares: number;
+    entryTime: number;
+    exitReason: string;
+    score: number;
+    confidence: number;
+    lastBid: number | null;
+  };
+  const pendingResolutions: PendingResolution[] = [];
+
+  function flushResolutionLogs(final: boolean): void {
+    if (pendingResolutions.length === 0) return;
+    const windowId = String((ctx.slotEndMs - 300_000) / 1000);
+    const result = ctx.getMarketResult();
+    const close = result?.closePrice ?? null;
+
+    if (result && close !== null) {
+      const winner = close >= result.openPrice ? "UP" : "DOWN";
+      while (pendingResolutions.length > 0) {
+        const p = pendingResolutions.shift()!;
+        const won = winner === p.side;
+        if (!won) log(`[resolution] ${p.side} LOST — resolved at 0.00`, "red");
+        logTrade({
+          window: windowId,
+          direction: p.side,
+          entryPrice: p.entryPrice,
+          exitPrice: won ? 1.0 : 0.0,
+          shares: p.shares,
+          exitReason: won ? p.exitReason : `${p.exitReason} loss`,
+          score: p.score,
+          confidence: p.confidence,
+          durationMs: Date.now() - p.entryTime,
+        });
+      }
+      return;
+    }
+
+    // Close price never arrived and we're tearing down — log best estimate
+    // rather than silently dropping the trade. Marked so it's visible in the CSV.
+    if (final) {
+      while (pendingResolutions.length > 0) {
+        const p = pendingResolutions.shift()!;
+        logTrade({
+          window: windowId,
+          direction: p.side,
+          entryPrice: p.entryPrice,
+          exitPrice: p.lastBid ?? 1.0,
+          shares: p.shares,
+          exitReason: `${p.exitReason} (unconfirmed)`,
+          score: p.score,
+          confidence: p.confidence,
+          durationMs: Date.now() - p.entryTime,
+        });
+      }
+    }
+  }
+
+  const resolutionFlushPoll = setInterval(() => flushResolutionLogs(false), 2_000);
+  timers.push(resolutionFlushPoll as unknown as NodeJS.Timeout);
 
   // Dynamic thresholds based on gap (BTC price minus strike price).
   // Large positive gap = BTC already winning → lower confidence bar, bigger target.
@@ -284,6 +350,8 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
 
           let partialSold = false;
           let fullyExited = false;
+          let bearishReads = 0;        // consecutive bearish *distinct* signals before bailing
+          let lastSeenSignalTs = 0;    // dedupe: signal.json only refreshes every ~20s
           countdownActive = true;
 
           function sellShares(shares: number, reason: string, onDone?: () => void) {
@@ -334,11 +402,36 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
             const bid = ctx.orderBook.bestBidPrice(side);
             const holdingNow = partialSold ? holdShares : filledShares;
 
-            // Regime flip check — bail immediately if market turns bearish mid-trade
-            const liveSignal = readSignal();
-            if (liveSignal && (liveSignal.regime === "TREND_DOWN" || liveSignal.regime === "LONG_SQUEEZE")) {
+            // Exit logic — two distinct dangers, handled separately:
+            //
+            // (1) REAL DUMP: the bid is actually dropping below our entry. This is
+            //     real-time truth and the biggest source of loss (−$19 last night).
+            //     Bail FAST — every second of delay deepens the loss.
+            //
+            // (2) SLOW BLEED: regime turns bearish but price is still holding near
+            //     entry. The regime is a 20s-stale noisy classifier, so a single
+            //     bearish refresh is usually noise (68 trades bled ~$3 panic-selling
+            //     at −1 cent on a flicker). Require 2 distinct refreshes to confirm.
+            const DUMP_EXIT_MARGIN = 0.06;   // bid this far below entry = real adverse move
+            if (bid !== null && bid < buyPrice - DUMP_EXIT_MARGIN) {
               process.stdout.write("\n");
-              log(`[orderflow] REGIME FLIP — ${liveSignal.regime}, selling now`, "red");
+              log(`[orderflow] PRICE DUMP — bid ${bid.toFixed(2)} dropped below entry ${buyPrice.toFixed(2)}, selling now`, "red");
+              fullyExited = true;
+              countdownActive = false;
+              clearInterval(pricePoller);
+              sellShares(holdingNow, "price dump", () => { inPosition = false; });
+              return;
+            }
+
+            const liveSignal = readSignal();
+            if (liveSignal && liveSignal.timestamp !== lastSeenSignalTs) {
+              lastSeenSignalTs = liveSignal.timestamp;
+              const bearish = liveSignal.regime === "TREND_DOWN" || liveSignal.regime === "LONG_SQUEEZE";
+              bearishReads = bearish ? bearishReads + 1 : 0;
+            }
+            if (bearishReads >= 2) {
+              process.stdout.write("\n");
+              log(`[orderflow] REGIME FLIP — confirmed bearish over ${bearishReads} refreshes, selling now`, "red");
               fullyExited = true;
               countdownActive = false;
               clearInterval(pricePoller);
@@ -365,13 +458,25 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
                 return;
               }
 
-              // Window closing — release lock and let resolution handle payout
+              // Window closing — release lock and let resolution handle payout.
+              // Buffer the trade so it reaches the CSV with the real outcome
+              // (this branch previously never logged at all).
               if (remaining < 10_000) {
                 process.stdout.write("\n");
                 log(`[orderflow] window closing — holding ${holdingNow.toFixed(2)}sh to resolution`, "green");
                 fullyExited = true;
                 countdownActive = false;
                 clearInterval(pricePoller);
+                pendingResolutions.push({
+                  side: "UP",
+                  entryPrice: buyPrice,
+                  shares: holdingNow,
+                  entryTime,
+                  exitReason: "hold resolution",
+                  score: entryScore,
+                  confidence: entryConfidence,
+                  lastBid: bid,
+                });
                 inPosition = false;
               }
               return;
@@ -426,7 +531,7 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
   function trySnipe() {
     if (destroyed || inPosition) return;
     const remaining = ctx.slotEndMs - Date.now();
-    if (remaining > SNIPER_WINDOW_MS || remaining < 10_000) return;
+    if (remaining > SNIPER_WINDOW_MS || remaining < 30_000) return;
 
     const upBid = ctx.orderBook.bestBidPrice("UP");
     const downBid = ctx.orderBook.bestBidPrice("DOWN");
@@ -441,8 +546,15 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
     const tokenId = side === "UP" ? ctx.clobTokenIds[0] : ctx.clobTokenIds[1];
     const askInfo = ctx.orderBook.bestAskInfo(side);
 
-    if (!askInfo || askInfo.price > 0.99 || askInfo.liquidity < 1) {
-      log(`[sniper] ${side} @ ${decidedBid.toFixed(2)} but ask too high/no liquidity`, "yellow");
+    if (!askInfo || askInfo.liquidity < 1) {
+      log(`[sniper] ${side} @ ${decidedBid.toFixed(2)} but no liquidity`, "yellow");
+      return;
+    }
+
+    // Cap the price we'll pay. Above this the bet is "risk $0.96 to make $0.04" —
+    // a single whipsaw wipes out dozens of wins, so skip it entirely.
+    if (askInfo.price > SNIPER_MAX_ASK) {
+      log(`[sniper] ${side} @ ${decidedBid.toFixed(2)} but ask ${askInfo.price.toFixed(2)} > max ${SNIPER_MAX_ASK}`, "yellow");
       return;
     }
 
@@ -460,7 +572,13 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
       expireAtMs: ctx.slotEndMs - 10_000,
 
       onFilled(filledShares) {
-        log(`[sniper] BUY filled — ${filledShares}sh @ ${buyPrice} | holding to resolution`, "green");
+        log(`[sniper] ${side} filled — ${filledShares}sh @ ${buyPrice} | holding to resolution`, "green");
+
+        // Require the drop to persist across reads before bailing. A single
+        // sub-threshold tick is almost always a thin-book wick that recovers —
+        // bailing on it sells into garbage liquidity (cost us -$3 on a DOWN bet
+        // that ultimately won). A real reversal stays down for consecutive reads.
+        let bailReads = 0;
 
         const watchPoller = setInterval(() => {
           if (destroyed) { clearInterval(watchPoller); return; }
@@ -470,10 +588,19 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
             `\r[sniper] HOLDING ${side} | bid=${currentBid?.toFixed(2) ?? "??"} remaining=${Math.round(rem / 1000)}s`.padEnd(80),
           );
 
-          // Bail if price reverses hard
+          // Count consecutive sub-threshold reads; reset the moment it recovers.
           if (currentBid !== null && currentBid < SNIPER_BAIL) {
+            bailReads++;
+          } else {
+            bailReads = 0;
+          }
+
+          // Bail only if the drop held for 2 consecutive reads (~4s) AND there's
+          // still time for it to matter. Inside the final 15s a wick can't be
+          // distinguished from resolution noise, so hold to the outcome instead.
+          if (bailReads >= 2 && currentBid !== null && rem > 15_000) {
             process.stdout.write("\n");
-            log(`[sniper] BAIL — dropped to ${currentBid.toFixed(2)}, selling`, "red");
+            log(`[sniper] BAIL — held below ${SNIPER_BAIL} for ${bailReads} reads (bid=${currentBid.toFixed(2)}), selling`, "red");
             clearInterval(watchPoller);
             const sellPrice = currentBid ?? 0.01;
             ctx.postOrders([{
@@ -498,21 +625,22 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
             return;
           }
 
-          // Window closing — let it redeem at 1.00
+          // Window closing — hold through resolution. The actual outcome isn't
+          // known yet (a last-second reversal resolves at 0.00, not 1.00), so
+          // buffer the trade and log it once closePrice arrives.
           if (rem < 10_000) {
             process.stdout.write("\n");
-            log(`[sniper] window closing — ${filledShares}sh resolving at 1.00`, "green");
+            log(`[sniper] window closing — ${filledShares}sh held to resolution`, "green");
             clearInterval(watchPoller);
-            logTrade({
-              window: String((ctx.slotEndMs - 300_000) / 1000),
-              direction: side!,
+            pendingResolutions.push({
+              side: side!,
               entryPrice: buyPrice,
-              exitPrice: 1.0,
               shares: filledShares,
+              entryTime,
               exitReason: "sniper resolution",
               score: 1.0,
               confidence: 1.0,
-              durationMs: Date.now() - entryTime,
+              lastBid: currentBid,
             });
             inPosition = false;
           }
@@ -561,6 +689,9 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
 
   return () => {
     destroyed = true;
+    // Resolution data typically arrives just before destroy — flush held trades
+    // here with the real outcome, since the 2s poller usually misses that window.
+    flushResolutionLogs(true);
     for (const t of timers) clearTimeout(t);
     clearInterval(poll);
     clearInterval(sniperPoll);
