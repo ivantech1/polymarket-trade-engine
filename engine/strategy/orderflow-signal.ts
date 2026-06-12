@@ -9,7 +9,16 @@ const SCORE_THRESHOLD = 0.55;   // 0.45 flooded us with marginal coin-flips that
 const CONFIDENCE_THRESHOLD = 0.62;
 const REPRICE_TARGET = 0.20;
 const MAX_BUY_PRICE = 0.65;
-const MIN_BUY_PRICE = 0.30;        // skip if crowd is >70% bearish
+const MIN_BUY_PRICE = 0.45;        // skip the uncertain 0.30-0.45 zone — book flips too easily there
+
+// Flip-catch: enter when price is at an extreme (e.g. 0.20) and reversing hard.
+// Separate from normal entry — needs stronger signal and confirmed rising bids.
+const FLIP_CATCH_MAX_PRICE = 0.38;       // only flip-catch when token is priced below this
+const FLIP_CATCH_SCORE = 0.65;           // stronger score required — contrarian play
+const FLIP_CATCH_CONFIDENCE = 0.72;      // higher confidence bar
+const FLIP_CATCH_MIN_BID_RISE = 0.04;    // bid must have risen at least this much across last 4 polls
+const FLIP_CATCH_MAX_SHARES = 3;         // smaller position — risk is higher at extremes
+const FLIP_CATCH_DUMP_MARGIN = 0.08;     // wider dump exit — low prices have more natural noise
 const SIGNAL_MAX_AGE_MS = 30_000;
 const POLL_INTERVAL_MS = 10_000;
 const MIN_REMAINING_MS = 90_000;
@@ -294,18 +303,6 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
 
     const buyPrice = askInfo.price;
 
-    if (buyPrice > MAX_BUY_PRICE) {
-      log(`[orderflow] skip — ask ${buyPrice.toFixed(2)} above max ${MAX_BUY_PRICE}`, "yellow");
-      return;
-    }
-
-    if (buyPrice < MIN_BUY_PRICE) {
-      const crowdDesc = side === "UP" ? "crowd >70% bearish" : "crowd >70% bullish";
-      log(`[orderflow] skip — ask ${buyPrice.toFixed(2)} below min ${MIN_BUY_PRICE} (${crowdDesc})`, "yellow");
-      consecutiveQualifying = 0;
-      return;
-    }
-
     // Momentum check: skip if bid has been falling
     const currentBid = ctx.orderBook.bestBidPrice(side);
     if (lastBid !== null && currentBid !== null && currentBid < lastBid - 0.04) {
@@ -316,17 +313,42 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
     }
     lastBid = currentBid ?? lastBid;
 
-    // Book volatility check: skip if bid has been swinging wildly across recent polls
+    // Track bid history — used for both volatility gate and flip-catch detection
     if (currentBid !== null) {
       bidHistory.push(currentBid);
       if (bidHistory.length > BID_HISTORY_SIZE) bidHistory.shift();
     }
-    if (bidHistory.length >= BID_HISTORY_SIZE) {
-      const swing = Math.max(...bidHistory) - Math.min(...bidHistory);
-      if (swing > MAX_BID_SWING) {
-        consecutiveQualifying = 0;
-        log(`[orderflow] skip — book unstable, swing=${swing.toFixed(3)} > max=${MAX_BID_SWING}`, "yellow");
+
+    // Flip-catch: price is at an extreme (e.g. 0.20) and bid is rising fast across polls.
+    // The rising bid confirms the crowd is actually reversing, not just a noise tick.
+    const bidRise = bidHistory.length >= BID_HISTORY_SIZE
+      ? bidHistory[bidHistory.length - 1] - bidHistory[0]
+      : 0;
+    const flipCatch =
+      buyPrice < FLIP_CATCH_MAX_PRICE &&
+      Math.abs(signal.score) >= FLIP_CATCH_SCORE &&
+      signal.confidence >= FLIP_CATCH_CONFIDENCE &&
+      bidRise >= FLIP_CATCH_MIN_BID_RISE;
+
+    if (!flipCatch) {
+      if (buyPrice > MAX_BUY_PRICE) {
+        log(`[orderflow] skip — ask ${buyPrice.toFixed(2)} above max ${MAX_BUY_PRICE}`, "yellow");
         return;
+      }
+      if (buyPrice < MIN_BUY_PRICE) {
+        const crowdDesc = side === "UP" ? "crowd >55% bearish" : "crowd >55% bullish";
+        log(`[orderflow] skip — ask ${buyPrice.toFixed(2)} below min ${MIN_BUY_PRICE} (${crowdDesc})`, "yellow");
+        consecutiveQualifying = 0;
+        return;
+      }
+      // Book volatility check: skip if bid has been swinging wildly (flip-catch exempted — the swing IS the signal)
+      if (bidHistory.length >= BID_HISTORY_SIZE) {
+        const swing = Math.max(...bidHistory) - Math.min(...bidHistory);
+        if (swing > MAX_BID_SWING) {
+          consecutiveQualifying = 0;
+          log(`[orderflow] skip — book unstable, swing=${swing.toFixed(3)} > max=${MAX_BID_SWING}`, "yellow");
+          return;
+        }
       }
     }
 
@@ -338,13 +360,19 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
     }
 
     const sellTarget = Math.min(buyPrice + repriceTarget, 0.95);
-    const shares = sharesFromConfidenceAndGap(signal.confidence, effectiveGap);
+    // Flip-catch uses a fixed small size — risk is higher at price extremes
+    const shares = flipCatch
+      ? FLIP_CATCH_MAX_SHARES
+      : sharesFromConfidenceAndGap(signal.confidence, effectiveGap);
+    // Flip-catch gets a wider dump exit — low prices have more natural noise
+    const dumpExitMargin = flipCatch ? FLIP_CATCH_DUMP_MARGIN : 0.06;
 
     let holdToResolution = effectiveGap !== null && effectiveGap >= HOLD_GAP_THRESHOLD;
     const gapStr = gap !== null ? ` | gap=${gap >= 0 ? "+" : ""}${gap.toFixed(0)}` : "";
     const modeStr = holdToResolution ? " | HOLD TO RESOLUTION" : ` → ${sellTarget.toFixed(2)}`;
+    const entryTag = flipCatch ? " [FLIP-CATCH]" : "";
     log(
-      `[orderflow] ENTRY — ${signal.label} | score=${signal.score.toFixed(2)} conf=${signal.confidence.toFixed(2)} | ${side} @ ${buyPrice}${modeStr} | shares=${shares}${gapStr}`,
+      `[orderflow] ENTRY${entryTag} — ${signal.label} | score=${signal.score.toFixed(2)} conf=${signal.confidence.toFixed(2)} | ${side} @ ${buyPrice}${modeStr} | shares=${shares}${gapStr}`,
       "cyan",
     );
 
@@ -438,10 +466,9 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
             // (2) SLOW BLEED: regime turns adverse but price is still holding near
             //     entry. The regime is a 20s-stale noisy classifier, so a single
             //     adverse refresh is usually noise. Require 2 distinct refreshes to confirm.
-            const DUMP_EXIT_MARGIN = 0.06;   // bid this far below entry = real adverse move
-            if (bid !== null && bid < buyPrice - DUMP_EXIT_MARGIN) {
+            if (bid !== null && bid < buyPrice - dumpExitMargin) {
               process.stdout.write("\n");
-              log(`[orderflow] PRICE DUMP — bid ${bid.toFixed(2)} dropped below entry ${buyPrice.toFixed(2)}, selling now`, "red");
+              log(`[orderflow] PRICE DUMP — bid ${bid.toFixed(2)} dropped >${dumpExitMargin} below entry ${buyPrice.toFixed(2)}, selling now`, "red");
               fullyExited = true;
               countdownActive = false;
               clearInterval(pricePoller);
