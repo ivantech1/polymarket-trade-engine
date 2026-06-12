@@ -224,9 +224,17 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
     if (bidHistory.length >= BID_HISTORY_SIZE) {
       const swing = Math.max(...bidHistory) - Math.min(...bidHistory);
       if (swing > MAX_BID_SWING) {
+        consecutiveQualifying = 0;
         log(`[orderflow] skip — book unstable, swing=${swing.toFixed(3)} > max=${MAX_BID_SWING}`, "yellow");
         return;
       }
+    }
+
+    // Whale dump: cross-exchange divergence means a large seller is hitting one exchange
+    if (ctx.ticker.isWhaleDump) {
+      consecutiveQualifying = 0;
+      log(`[orderflow] skip — whale dump detected (cross-exchange divergence)`, "yellow");
+      return;
     }
 
     const sellTarget = Math.min(buyPrice + repriceTarget, 0.95);
@@ -346,7 +354,7 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
                 fullyExited = true;
                 countdownActive = false;
                 clearInterval(pricePoller);
-                sellShares(filledShares, "bail out gap shrink", () => { inPosition = false; });
+                sellShares(holdingNow, "bail out gap shrink", () => { inPosition = false; });
                 return;
               }
 
