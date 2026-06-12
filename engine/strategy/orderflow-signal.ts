@@ -93,6 +93,7 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
   let lastBid: number | null = null;
   let consecutiveQualifying = 0;
   let windowTraded = false;   // block re-entry after a win in the same window
+  let lastSignalAction: string | null = null;  // reset tracking state when direction flips
   const bidHistory: number[] = [];
 
   // Trades held to resolution can't be logged at window close — the outcome
@@ -213,28 +214,54 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
       return;
     }
 
-    // Block bearish and directionless regimes
-    if (["TREND_DOWN", "LONG_SQUEEZE", "RANGE", "HIGH_VOLATILITY"].includes(signal.regime)) {
+    if (signal.action === "NO_TRADE") {
       consecutiveQualifying = 0;
-      log(`[orderflow] skip — regime (${signal.regime})`, "yellow");
+      log("[orderflow] skip — signal is NO_TRADE", "yellow");
       return;
     }
 
-    // Gap check — skip BUY_UP if BTC is too far below the strike price
+    const side = signal.action === "BUY_DOWN" ? "DOWN" : "UP";
+
+    // Reset bid tracking state when direction flips between polls
+    if (lastSignalAction !== null && lastSignalAction !== signal.action) {
+      consecutiveQualifying = 0;
+      lastBid = null;
+      bidHistory.length = 0;
+    }
+    lastSignalAction = signal.action;
+
+    // Regime filter — block regimes that oppose our direction
+    const blockedRegimes = side === "UP"
+      ? ["TREND_DOWN", "LONG_SQUEEZE", "RANGE", "HIGH_VOLATILITY"]
+      : ["TREND_UP", "SHORT_SQUEEZE", "RANGE", "HIGH_VOLATILITY"];
+    if (blockedRegimes.includes(signal.regime)) {
+      consecutiveQualifying = 0;
+      log(`[orderflow] skip — regime (${signal.regime}) blocks ${side}`, "yellow");
+      return;
+    }
+
     const openPrice = ctx.getMarketResult()?.openPrice ?? null;
     const btcPrice = ctx.ticker.price;
     const gap = openPrice !== null && btcPrice !== undefined ? btcPrice - openPrice : null;
-    if (gap !== null && gap < MIN_GAP_USD) {
+
+    // Gap check — for UP: skip if BTC too far below strike; for DOWN: skip if too far above
+    if (side === "UP" && gap !== null && gap < MIN_GAP_USD) {
       consecutiveQualifying = 0;
-      log(`[orderflow] skip — BTC $${gap.toFixed(0)} below strike (min ${MIN_GAP_USD})`, "yellow");
+      log(`[orderflow] skip — BTC $${gap.toFixed(0)} below strike (min ${MIN_GAP_USD} for UP)`, "yellow");
+      return;
+    }
+    if (side === "DOWN" && gap !== null && gap > -MIN_GAP_USD) {
+      consecutiveQualifying = 0;
+      log(`[orderflow] skip — BTC $${gap.toFixed(0)} above strike (max ${-MIN_GAP_USD} for DOWN)`, "yellow");
       return;
     }
 
-    const { confidenceThreshold, repriceTarget } = thresholdsFromGap(gap);
+    // Effective gap from this side's perspective: positive = BTC already on our side of strike
+    const effectiveGap = gap !== null ? (side === "UP" ? gap : -gap) : null;
+    const { confidenceThreshold, repriceTarget } = thresholdsFromGap(effectiveGap);
 
     const qualifies =
-      signal.score > 0 &&
-      signal.score >= SCORE_THRESHOLD &&
+      Math.abs(signal.score) >= SCORE_THRESHOLD &&
       signal.confidence >= confidenceThreshold;
 
     if (!qualifies) {
@@ -257,8 +284,7 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
     }
     consecutiveQualifying = 0;
 
-    const side = "UP";
-    const tokenId = ctx.clobTokenIds[0];
+    const tokenId = side === "UP" ? ctx.clobTokenIds[0] : ctx.clobTokenIds[1];
     const askInfo = ctx.orderBook.bestAskInfo(side);
 
     if (!askInfo || askInfo.liquidity < 1) {
@@ -274,7 +300,8 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
     }
 
     if (buyPrice < MIN_BUY_PRICE) {
-      log(`[orderflow] skip — ask ${buyPrice.toFixed(2)} below min ${MIN_BUY_PRICE} (crowd >70% bearish)`, "yellow");
+      const crowdDesc = side === "UP" ? "crowd >70% bearish" : "crowd >70% bullish";
+      log(`[orderflow] skip — ask ${buyPrice.toFixed(2)} below min ${MIN_BUY_PRICE} (${crowdDesc})`, "yellow");
       consecutiveQualifying = 0;
       return;
     }
@@ -311,13 +338,13 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
     }
 
     const sellTarget = Math.min(buyPrice + repriceTarget, 0.95);
-    const shares = sharesFromConfidenceAndGap(signal.confidence, gap);
+    const shares = sharesFromConfidenceAndGap(signal.confidence, effectiveGap);
 
-    let holdToResolution = gap !== null && gap >= HOLD_GAP_THRESHOLD;
+    let holdToResolution = effectiveGap !== null && effectiveGap >= HOLD_GAP_THRESHOLD;
     const gapStr = gap !== null ? ` | gap=${gap >= 0 ? "+" : ""}${gap.toFixed(0)}` : "";
     const modeStr = holdToResolution ? " | HOLD TO RESOLUTION" : ` → ${sellTarget.toFixed(2)}`;
     log(
-      `[orderflow] ENTRY — ${signal.label} | score=${signal.score.toFixed(2)} conf=${signal.confidence.toFixed(2)} | UP @ ${buyPrice}${modeStr} | shares=${shares}${gapStr}`,
+      `[orderflow] ENTRY — ${signal.label} | score=${signal.score.toFixed(2)} conf=${signal.confidence.toFixed(2)} | ${side} @ ${buyPrice}${modeStr} | shares=${shares}${gapStr}`,
       "cyan",
     );
 
@@ -350,11 +377,11 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
 
           let partialSold = false;
           let fullyExited = false;
-          let bearishReads = 0;        // consecutive bearish *distinct* signals before bailing
+          let adverseReads = 0;        // consecutive adverse-regime *distinct* signals before bailing
           let lastSeenSignalTs = 0;    // dedupe: signal.json only refreshes every ~20s
           countdownActive = true;
 
-          function sellShares(shares: number, reason: string, onDone?: () => void) {
+          function sellShares(sharesToSell: number, reason: string, onDone?: () => void) {
             const pendingSells = ctx.pendingOrders.filter((o) => o.action === "sell");
             if (pendingSells.length > 0) {
               log(`[orderflow] sell already in flight (${reason}), skipping`, "yellow");
@@ -363,18 +390,18 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
             }
             const bid = ctx.orderBook.bestBidPrice(side);
             const sellPrice = (bid && bid > 0) ? bid : 0.01;
-            log(`[orderflow] ${reason} — FAK sell ${shares.toFixed(4)}sh @ ${sellPrice}`, "cyan");
+            log(`[orderflow] ${reason} — FAK sell ${sharesToSell.toFixed(4)}sh @ ${sellPrice}`, "cyan");
             ctx.postOrders([{
-              req: { tokenId, action: "sell", price: sellPrice, shares, orderType: "FAK" },
+              req: { tokenId, action: "sell", price: sellPrice, shares: sharesToSell, orderType: "FAK" },
               expireAtMs: ctx.slotEndMs,
               onFilled() {
                 log(`[orderflow] SELL filled @ ${sellPrice} (${reason})`, "green");
                 logTrade({
                   window: windowId,
-                  direction: "UP",
+                  direction: side,
                   entryPrice: buyPrice,
                   exitPrice: sellPrice,
-                  shares,
+                  shares: sharesToSell,
                   exitReason: reason,
                   score: entryScore,
                   confidence: entryConfidence,
@@ -408,10 +435,9 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
             //     real-time truth and the biggest source of loss (−$19 last night).
             //     Bail FAST — every second of delay deepens the loss.
             //
-            // (2) SLOW BLEED: regime turns bearish but price is still holding near
+            // (2) SLOW BLEED: regime turns adverse but price is still holding near
             //     entry. The regime is a 20s-stale noisy classifier, so a single
-            //     bearish refresh is usually noise (68 trades bled ~$3 panic-selling
-            //     at −1 cent on a flicker). Require 2 distinct refreshes to confirm.
+            //     adverse refresh is usually noise. Require 2 distinct refreshes to confirm.
             const DUMP_EXIT_MARGIN = 0.06;   // bid this far below entry = real adverse move
             if (bid !== null && bid < buyPrice - DUMP_EXIT_MARGIN) {
               process.stdout.write("\n");
@@ -426,12 +452,15 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
             const liveSignal = readSignal();
             if (liveSignal && liveSignal.timestamp !== lastSeenSignalTs) {
               lastSeenSignalTs = liveSignal.timestamp;
-              const bearish = liveSignal.regime === "TREND_DOWN" || liveSignal.regime === "LONG_SQUEEZE";
-              bearishReads = bearish ? bearishReads + 1 : 0;
+              // Adverse = regime flipped to oppose our position direction
+              const adverse = side === "UP"
+                ? (liveSignal.regime === "TREND_DOWN" || liveSignal.regime === "LONG_SQUEEZE")
+                : (liveSignal.regime === "TREND_UP" || liveSignal.regime === "SHORT_SQUEEZE");
+              adverseReads = adverse ? adverseReads + 1 : 0;
             }
-            if (bearishReads >= 2) {
+            if (adverseReads >= 2) {
               process.stdout.write("\n");
-              log(`[orderflow] REGIME FLIP — confirmed bearish over ${bearishReads} refreshes, selling now`, "red");
+              log(`[orderflow] REGIME FLIP — confirmed adverse over ${adverseReads} refreshes, selling now`, "red");
               fullyExited = true;
               countdownActive = false;
               clearInterval(pricePoller);
@@ -440,17 +469,18 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
             }
 
             if (holdToResolution) {
-              // Recompute current gap every tick to watch for gap shrinkage
               const currentBtc = ctx.ticker.price;
               const currentGap = openPrice !== null && currentBtc !== undefined
                 ? currentBtc - openPrice : null;
+              const currentEffectiveGap = currentGap !== null
+                ? (side === "UP" ? currentGap : -currentGap) : null;
               const gapNow = currentGap !== null ? `gap=${currentGap >= 0 ? "+" : ""}${currentGap.toFixed(0)}` : "gap=??";
               process.stdout.write(`\r[orderflow] HOLDING TO RESOLUTION | bid=${bid?.toFixed(2) ?? "??"} ${gapNow} remaining=${Math.round(remaining / 1000)}s holding=${holdingNow.toFixed(2)}sh`.padEnd(100));
 
-              // Bail out if gap shrinks below safety threshold — BTC heading back to strike
-              if (currentGap !== null && currentGap < BAIL_OUT_GAP) {
+              // Bail out if effective gap shrinks — BTC heading back toward strike against our position
+              if (currentEffectiveGap !== null && currentEffectiveGap < BAIL_OUT_GAP) {
                 process.stdout.write("\n");
-                log(`[orderflow] BAIL OUT — gap shrunk to $${currentGap.toFixed(0)}, selling now`, "red");
+                log(`[orderflow] BAIL OUT — gap shrunk to $${currentGap?.toFixed(0)}, selling now`, "red");
                 fullyExited = true;
                 countdownActive = false;
                 clearInterval(pricePoller);
@@ -458,9 +488,6 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
                 return;
               }
 
-              // Window closing — release lock and let resolution handle payout.
-              // Buffer the trade so it reaches the CSV with the real outcome
-              // (this branch previously never logged at all).
               if (remaining < 10_000) {
                 process.stdout.write("\n");
                 log(`[orderflow] window closing — holding ${holdingNow.toFixed(2)}sh to resolution`, "green");
@@ -468,7 +495,7 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
                 countdownActive = false;
                 clearInterval(pricePoller);
                 pendingResolutions.push({
-                  side: "UP",
+                  side,
                   entryPrice: buyPrice,
                   shares: holdingNow,
                   entryTime,
