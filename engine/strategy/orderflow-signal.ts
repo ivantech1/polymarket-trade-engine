@@ -22,6 +22,13 @@ const REQUIRED_CONSECUTIVE = 2;    // require 2 back-to-back qualifying signals 
 const MAX_BID_SWING = 0.08;        // skip if book swung this much across last 4 polls
 const BID_HISTORY_SIZE = 4;
 
+// Sniper constants — last-minute "already decided" entries
+const SNIPER_THRESHOLD = 0.95;     // enter when a side's bid is at or above this
+const SNIPER_BAIL = 0.90;          // sell immediately if price drops below this after entry
+const SNIPER_WINDOW_MS = 90_000;   // only snipe in the last 90 seconds
+const SNIPER_SHARES = 10;          // size up — risk is tiny at 0.95+
+const SNIPER_POLL_MS = 2_000;      // check every 2s in the sniper window
+
 type Signal = {
   action: "BUY_UP" | "BUY_DOWN" | "NO_TRADE";
   score: number;
@@ -416,6 +423,116 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
     ]);
   }
 
+  function trySnipe() {
+    if (destroyed || inPosition) return;
+    const remaining = ctx.slotEndMs - Date.now();
+    if (remaining > SNIPER_WINDOW_MS || remaining < 10_000) return;
+
+    const upBid = ctx.orderBook.bestBidPrice("UP");
+    const downBid = ctx.orderBook.bestBidPrice("DOWN");
+
+    let side: "UP" | "DOWN" | null = null;
+    if (upBid !== null && upBid >= SNIPER_THRESHOLD) side = "UP";
+    else if (downBid !== null && downBid >= SNIPER_THRESHOLD) side = "DOWN";
+
+    if (!side) return;
+
+    const decidedBid = side === "UP" ? upBid! : downBid!;
+    const tokenId = side === "UP" ? ctx.clobTokenIds[0] : ctx.clobTokenIds[1];
+    const askInfo = ctx.orderBook.bestAskInfo(side);
+
+    if (!askInfo || askInfo.price > 0.99 || askInfo.liquidity < 1) {
+      log(`[sniper] ${side} @ ${decidedBid.toFixed(2)} but ask too high/no liquidity`, "yellow");
+      return;
+    }
+
+    const buyPrice = askInfo.price;
+    inPosition = true;
+    log(
+      `[sniper] ENTRY — ${side} decided @ ${decidedBid.toFixed(2)} | buying @ ${buyPrice} | ${Math.round(remaining / 1000)}s left`,
+      "cyan",
+    );
+
+    const entryTime = Date.now();
+
+    ctx.postOrders([{
+      req: { tokenId, action: "buy", price: buyPrice, shares: SNIPER_SHARES, orderType: "FOK" },
+      expireAtMs: ctx.slotEndMs - 10_000,
+
+      onFilled(filledShares) {
+        log(`[sniper] BUY filled — ${filledShares}sh @ ${buyPrice} | holding to resolution`, "green");
+
+        const watchPoller = setInterval(() => {
+          if (destroyed) { clearInterval(watchPoller); return; }
+          const rem = ctx.slotEndMs - Date.now();
+          const currentBid = ctx.orderBook.bestBidPrice(side!);
+          process.stdout.write(
+            `\r[sniper] HOLDING ${side} | bid=${currentBid?.toFixed(2) ?? "??"} remaining=${Math.round(rem / 1000)}s`.padEnd(80),
+          );
+
+          // Bail if price reverses hard
+          if (currentBid !== null && currentBid < SNIPER_BAIL) {
+            process.stdout.write("\n");
+            log(`[sniper] BAIL — dropped to ${currentBid.toFixed(2)}, selling`, "red");
+            clearInterval(watchPoller);
+            const sellPrice = currentBid ?? 0.01;
+            ctx.postOrders([{
+              req: { tokenId, action: "sell", price: sellPrice, shares: filledShares, orderType: "FAK" },
+              expireAtMs: ctx.slotEndMs,
+              onFilled() {
+                logTrade({
+                  window: String((ctx.slotEndMs - 300_000) / 1000),
+                  direction: side!,
+                  entryPrice: buyPrice,
+                  exitPrice: sellPrice,
+                  shares: filledShares,
+                  exitReason: "sniper bail",
+                  score: 1.0,
+                  confidence: 1.0,
+                  durationMs: Date.now() - entryTime,
+                });
+                inPosition = false;
+              },
+              onFailed() { inPosition = false; },
+            }]);
+            return;
+          }
+
+          // Window closing — let it redeem at 1.00
+          if (rem < 10_000) {
+            process.stdout.write("\n");
+            log(`[sniper] window closing — ${filledShares}sh resolving at 1.00`, "green");
+            clearInterval(watchPoller);
+            logTrade({
+              window: String((ctx.slotEndMs - 300_000) / 1000),
+              direction: side!,
+              entryPrice: buyPrice,
+              exitPrice: 1.0,
+              shares: filledShares,
+              exitReason: "sniper resolution",
+              score: 1.0,
+              confidence: 1.0,
+              durationMs: Date.now() - entryTime,
+            });
+            inPosition = false;
+          }
+        }, SNIPER_POLL_MS);
+
+        timers.push(watchPoller as unknown as NodeJS.Timeout);
+      },
+
+      onExpired() {
+        log("[sniper] buy expired — no fill", "yellow");
+        inPosition = false;
+      },
+
+      onFailed(reason) {
+        log(`[sniper] buy failed (${reason})`, "red");
+        inPosition = false;
+      },
+    }]);
+  }
+
   const poll = setInterval(() => {
     if (destroyed) {
       clearInterval(poll);
@@ -431,12 +548,22 @@ export const orderflowSignalStrategy: Strategy = async (ctx) => {
 
   timers.push(poll as unknown as NodeJS.Timeout);
 
+  // Sniper poller — runs every 2s, only acts in the last 90 seconds
+  const sniperPoll = setInterval(() => {
+    if (destroyed) { clearInterval(sniperPoll); return; }
+    if (Date.now() >= ctx.slotEndMs) { clearInterval(sniperPoll); return; }
+    trySnipe();
+  }, SNIPER_POLL_MS);
+
+  timers.push(sniperPoll as unknown as NodeJS.Timeout);
+
   tryTrade();
 
   return () => {
     destroyed = true;
     for (const t of timers) clearTimeout(t);
     clearInterval(poll);
+    clearInterval(sniperPoll);
     release();
   };
 };
